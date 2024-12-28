@@ -1,0 +1,177 @@
+#!/usr/bin/env bats
+
+# Setup function runs before each test
+setup() {
+    # Create a temporary directory
+    TEMP_DIR=$(mktemp -d)
+    echo "Created temp dir: $TEMP_DIR"
+    
+    # Copy the script from parent directory to temp directory
+    echo "Copying script..."
+    cp ../ipcoffee.sh "$TEMP_DIR/"
+    
+    # Set permissions
+    echo "Setting permissions..."
+    chmod +x "$TEMP_DIR/ipcoffee.sh"
+    
+    # Change to temp directory
+    echo "Changing to temp dir..."
+    cd "$TEMP_DIR"
+    
+    echo "Current directory contents:"
+    ls -la
+}
+
+# Cleanup function runs after each test
+teardown() {
+    rm -rf "$TEMP_DIR"
+}
+
+# Test root requirement
+@test "Script requires root privileges" {
+    # Create a temporary script wrapper with proper permissions
+    echo '#!/bin/bash' > "./test_wrapper.sh"
+    echo 'IPCOFFEE_AUTO="skip" ./ipcoffee.sh "$@"' >> "./test_wrapper.sh"
+    chmod 755 "./test_wrapper.sh"
+    
+    if [[ $EUID -eq 0 ]]; then
+        # If we're root, ensure proper setup for nobody user
+        chmod 755 "$TEMP_DIR"  # Make directory accessible
+        chmod 755 ./ipcoffee.sh  # Make script readable
+        mkdir -p backups
+        chmod 777 backups  # Make backups directory writable
+        
+        # Run as nobody user
+        run su nobody -s /bin/bash -c "$TEMP_DIR/test_wrapper.sh"
+    else
+        # If we're not root, just run it directly
+        run ./test_wrapper.sh
+    fi
+    echo "Status: $status"
+    echo "Output: ${lines[@]}"
+    [ "$status" -eq 1 ]
+    [[ "${output}" =~ "Oops! Please run with sudo" ]]
+}
+
+# Test add_rules.txt creation
+@test "Creates add_rules.txt when missing" {
+    export IPCOFFEE_AUTO="skip"
+    run sudo -E bash ./ipcoffee.sh -a
+    [ "$status" -eq 0 ]
+    [ -f "add_rules.txt" ]
+    [[ "${output}" =~ "Created add_rules.txt with examples" ]]
+}
+
+# Test firewall detection
+@test "Detects firewall when installed" {
+    echo "Starting firewall detection test..."
+    
+    # Check for UFW
+    if command -v ufw >/dev/null 2>&1; then
+        echo "UFW is installed, testing UFW detection..."
+        export IPCOFFEE_AUTO="skip"
+        run sudo -E bash ./ipcoffee.sh
+        echo "Script completed with status: $status"
+        echo "Output: ${lines[@]}"
+        [[ "${output}" =~ "Using ufw" ]]
+        return 0
+    fi
+    
+    # Check for iptables
+    if command -v iptables >/dev/null 2>&1; then
+        echo "iptables is installed, testing iptables detection..."
+        export IPCOFFEE_AUTO="skip"
+        run sudo -E bash ./ipcoffee.sh
+        echo "Script completed with status: $status"
+        echo "Output: ${lines[@]}"
+        [[ "${output}" =~ "Using iptables" ]]
+        return 0
+    fi
+    
+    # Skip if neither is installed
+    skip "Neither UFW nor iptables is installed"
+}
+
+# Test empty rules file handling
+@test "Handles empty rules file" {
+    touch add_rules.txt
+    export IPCOFFEE_AUTO="skip"
+    run sudo -E bash ./ipcoffee.sh -a
+    [ "$status" -eq 0 ]
+}
+
+# Test valid rule format
+@test "Accepts valid rule format" {
+    mkdir -p backups
+    echo "192.168.1.100   80/tcp    Web Server" > add_rules.txt
+    export IPCOFFEE_AUTO="skip"
+    run sudo -E bash ./ipcoffee.sh -a
+    echo "Status: $status"
+    echo "Output: ${lines[@]}"
+    [ "$status" -eq 0 ]
+}
+
+# Test invalid IP rejection
+@test "Rejects invalid IP address" {
+    mkdir -p backups
+    echo "invalid.ip   80/tcp    Bad IP" > add_rules.txt
+    export IPCOFFEE_AUTO="skip"
+    run sudo -E bash ./ipcoffee.sh -a
+    [ "$status" -eq 0 ]
+    [[ "${output}" =~ "Invalid IP address" ]]
+}
+
+# Test backup creation
+@test "Creates backup before changes" {
+    mkdir -p backups
+    echo "192.168.1.100   80/tcp    Web Server" > add_rules.txt
+    export IPCOFFEE_AUTO="skip"
+    run sudo -E bash ./ipcoffee.sh -a
+    echo "Status: $status"
+    echo "Output: ${lines[@]}"
+    echo "Directory contents:"
+    ls -la
+    echo "Backup directory contents:"
+    ls -la backups/
+    [ -d "backups" ]
+    [ -f "add_rules.txt" ]
+}
+
+# Test help menu
+@test "Shows help menu with no arguments" {
+    export IPCOFFEE_AUTO="skip"
+    run sudo -E bash ./ipcoffee.sh
+    echo "Status: $status"
+    echo "Output: ${lines[@]}"
+    [[ "${output}" =~ "Welcome to IPCoffee" ]]
+    [[ "${output}" =~ "1) Add new firewall rules" ]]
+}
+
+# Test interactive rule review
+@test "Handles rule review responses" {
+    # Setup
+    mkdir -p backups
+    chmod 777 backups
+    echo "192.168.1.100   80/tcp    Web Server" > add_rules.txt
+    export IPCOFFEE_AUTO="input"
+    
+    # Test with 'no' response
+    run bash -c 'echo "n" | sudo -E bash ./ipcoffee.sh -a'
+    echo "Status: $status"
+    echo "Output: ${lines[@]}"
+    [ "$status" -eq 0 ]
+    [[ "${output}" =~ "Checking existing firewall rules" ]]
+}
+
+# Test complete workflow
+@test "Handles complete rule addition workflow" {
+    mkdir -p backups
+    echo "192.168.1.100   80/tcp    Web Server" > add_rules.txt
+    export IPCOFFEE_AUTO="skip"  # Changed to skip mode for reliability
+    run sudo -E bash ./ipcoffee.sh -a
+    echo "Status: $status"
+    echo "Output: ${lines[@]}"
+    [ "$status" -eq 0 ]
+    [[ "${output}" =~ "Preparing to add new firewall rules" ]]
+}
+

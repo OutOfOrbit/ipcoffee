@@ -1,0 +1,336 @@
+#!/bin/bash
+#
+# IPCoffee - Firewall Rule Manager
+# Version: 2.0.0
+#
+# Description:
+#   A friendly script to manage UFW/iptables firewall rules
+#   Because managing IP rules shouldn't be harder than brewing coffee!
+#
+# Usage:
+#   ./ipcoffee.sh [-a|--add] [-d|--delete]
+#
+# Requirements:
+#   - UFW or iptables installed
+#   - Root/sudo privileges
+#
+# Exit Codes:
+#   0 - Success
+#   1 - No sudo privileges
+#   2 - No firewall installed
+#   3 - Operation failed
+
+# Enable strict error handling
+set -euo pipefail
+
+# Production configuration
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+# Testing automation configuration
+# NOTE: This variable is used for automated testing only.
+# In normal production use, this remains 'none' and can be ignored.
+AUTOMATION_TYPE="${IPCOFFEE_AUTO:-none}"  # Values: 'skip', 'input', or 'none'
+
+# Create backup directory if it doesn't exist
+BACKUP_DIR="./backups"
+mkdir -p "$BACKUP_DIR"
+
+# Check if we're running as root
+if [[ $EUID -ne 0 ]]; then 
+    echo -e "${RED}☕ Oops! Please run with sudo${NC}"
+    echo "Example: sudo ./ipcoffee.sh"
+    exit 1
+fi
+
+# Function to check which firewall is installed and active
+check_firewall() {
+    # In test mode, check what's actually installed
+    if [ "$AUTOMATION_TYPE" = "skip" ]; then
+        if command -v ufw >/dev/null 2>&1; then
+            echo "ufw"
+        elif command -v iptables >/dev/null 2>&1; then
+            echo "iptables"
+        else
+            echo "none"
+        fi
+        return 0
+    fi
+
+    # Normal mode checks for active firewalls
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        echo "ufw"
+    elif command -v iptables >/dev/null 2>&1 && iptables -L >/dev/null 2>&1; then
+        echo "iptables"
+    else
+        echo "none"
+    fi
+}
+
+# Verify firewall is properly set up
+verify_firewall_setup() {
+    echo "Checking firewall setup..."
+    local firewall_type=$(check_firewall)
+    echo "Detected firewall type: $firewall_type"
+    
+    if [ "$firewall_type" = "none" ]; then
+        echo -e "${RED}☹️ No supported firewall found!${NC}"
+        echo "Please install either ufw or iptables first."
+        echo "For Ubuntu/Debian: sudo apt install ufw"
+        exit 2
+    fi
+    
+    echo -e "${GREEN}✓ Using $firewall_type${NC}"
+}
+
+# Function to check existing rules
+check_existing_rules() {
+    echo -e "\n${YELLOW}☕ Checking existing firewall rules...${NC}"
+    
+    local firewall_type=$(check_firewall)
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local existing_rules_file="$BACKUP_DIR/existing_rules_$timestamp.txt"
+
+    # Ensure backup directory exists
+    mkdir -p "$BACKUP_DIR"
+
+    if [ "$firewall_type" = "ufw" ]; then
+        sudo ufw status numbered > "$existing_rules_file"
+    else
+        sudo iptables -L -n --line-numbers > "$existing_rules_file"
+    fi
+
+    echo -e "${GREEN}✓ Current rules saved to: $existing_rules_file${NC}"
+    
+    # Handle user interaction
+    # NOTE: The case statement below includes testing automation options
+    # but defaults to normal production behavior
+    case "$AUTOMATION_TYPE" in
+        skip)
+            # Testing only: Skip all user prompts
+            echo "[TEST MODE] Skipping rule review"
+            return 0
+            ;;
+        input)
+            # Testing only: Accept automated input
+            echo -e "Would you like to review existing rules before proceeding?"
+            read -p "Review rules? (y/n): " review
+            ;;
+        none|*)
+            # Normal production behavior
+            echo -e "Would you like to review existing rules before proceeding?"
+            read -p "Review rules? (y/n): " review
+            ;;
+    esac
+
+    if [[ $review =~ ^[Yy] ]]; then
+        less "$existing_rules_file"
+    fi
+}
+
+# Function to handle adding rules
+handle_add_rules() {
+    echo -e "\n${YELLOW}☕ Preparing to add new firewall rules...${NC}"
+    
+    # Check for rules file
+    if [ ! -f "add_rules.txt" ]; then
+        echo -e "${RED}Oops! Can't find add_rules.txt${NC}"
+        echo "I'll create a sample file for you..."
+        
+        cat > add_rules.txt << 'EOF'
+# IPCoffee Rules File
+# Format: IP_ADDRESS PORT/PROTOCOL COMMENT
+# Example:
+192.168.1.100   80/tcp    Web Server
+10.0.0.50       22/tcp    SSH Access
+172.16.0.10     443/tcp   HTTPS Server
+
+# Lines starting with # are ignored
+# Save this file and run the script again!
+EOF
+        echo -e "${GREEN}✓ Created add_rules.txt with examples${NC}"
+        echo "Please edit this file and run the script again!"
+        return 0
+    fi
+
+    check_existing_rules
+
+    # Process rules
+    local firewall_type=$(check_firewall)
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        
+        # Parse rule components
+        read -r ip port comment <<< "$line"
+        
+        # Validate IP address
+        if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo -e "${RED}Invalid IP address: $ip${NC}"
+            continue
+        fi
+        
+        # Add the rule based on firewall type
+        if [ "$firewall_type" = "ufw" ]; then
+            if [ "$AUTOMATION_TYPE" = "skip" ]; then
+                echo "[TEST MODE] Would add UFW rule: from $ip to any port $port"
+            else
+                sudo ufw allow from "$ip" to any port "${port%/*}" proto "${port#*/}"
+            fi
+        else
+            if [ "$AUTOMATION_TYPE" = "skip" ]; then
+                echo "[TEST MODE] Would add iptables rule: -A INPUT -p ${port#*/} -s $ip --dport ${port%/*} -j ACCEPT"
+            else
+                sudo iptables -A INPUT -p "${port#*/}" -s "$ip" --dport "${port%/*}" -j ACCEPT
+            fi
+        fi
+        
+        echo -e "${GREEN}✓ Added rule for $ip ($comment)${NC}"
+    done < add_rules.txt
+    
+    echo -e "\n${GREEN}✓ Firewall rules have been updated!${NC}"
+}
+
+# Function to handle deleting rules
+handle_delete_rules() {
+    echo -e "\n${YELLOW}☕ Preparing to delete firewall rules...${NC}"
+    local delete_file="delete_rules.txt"
+    local firewall_type=$(check_firewall)
+    
+    check_existing_rules
+    
+    # In test mode, skip the actual deletion
+    if [ "$AUTOMATION_TYPE" = "skip" ]; then
+        echo "[TEST MODE] Would handle rule deletion"
+        return 0
+    fi
+    
+    echo -e "\n${YELLOW}Would you like to delete specific rules?${NC}"
+    read -p "Create delete_rules.txt? (y/n): " create_file
+    
+    if [[ $create_file =~ ^[Yy] ]]; then
+        if [ "$firewall_type" = "ufw" ]; then
+            sudo ufw status numbered > "$delete_file"
+        else
+            sudo iptables -L -n --line-numbers > "$delete_file"
+        fi
+        
+        echo -e "${GREEN}Created $delete_file${NC}"
+        echo "Edit this file to keep only the rules you want to delete."
+        echo "Then run the script with -d option again."
+    else
+        if [ -f "$delete_file" ]; then
+            echo -e "\n${YELLOW}Found existing $delete_file${NC}"
+            echo "Proceeding with rule deletion..."
+            
+            echo -e "${RED}Warning: This will delete the selected firewall rules!${NC}"
+            read -p "Are you sure? (y/n): " confirm
+            
+            if [[ $confirm =~ ^[Yy] ]]; then
+                delete_selected_rules "$firewall_type" "$delete_file"
+            else
+                echo -e "${GREEN}Operation cancelled. No rules were deleted.${NC}"
+            fi
+        else
+            echo "You can edit $delete_file later and run the script again."
+        fi
+    fi
+}
+
+# Function to delete selected rules
+delete_selected_rules() {
+    local firewall_type=$1
+    local rules_file=$2
+    
+    echo -e "\n${YELLOW}☕ Deleting selected rules...${NC}"
+    
+    if [ "$firewall_type" = "ufw" ]; then
+        # UFW requires deleting rules by number in reverse order
+        local rules=($(grep -v '^#\|^$' "$rules_file" | tac))
+        for rule in "${rules[@]}"; do
+            rule_num=$(echo "$rule" | grep -o '^\[[0-9]*\]' | tr -d '[]')
+            if [ -n "$rule_num" ]; then
+                if [ "$AUTOMATION_TYPE" = "skip" ]; then
+                    echo "[TEST MODE] Would delete UFW rule: $rule_num"
+                else
+                    sudo ufw delete "$rule_num"
+                fi
+            fi
+        done
+    else
+        # For iptables, we need to handle deletion differently
+        while read -r line; do
+            [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+            rule_num=$(echo "$line" | awk '{print $1}')
+            if [ -n "$rule_num" ]; then
+                if [ "$AUTOMATION_TYPE" = "skip" ]; then
+                    echo "[TEST MODE] Would delete iptables rule: $rule_num"
+                else
+                    sudo iptables -D INPUT "$rule_num"
+                fi
+            fi
+        done < "$rules_file"
+    fi
+    
+    echo -e "${GREEN}✓ Selected rules have been deleted!${NC}"
+}
+
+# Show a friendly menu
+show_menu() {
+    echo -e "\n${YELLOW}☕ Welcome to IPCoffee! ☕${NC}"
+    echo "What would you like to brew today?"
+    echo
+    echo "1) Add new firewall rules"
+    echo "2) Delete existing rules"
+    echo "3) Exit"
+    echo
+
+    # Handle menu selection
+    case "$AUTOMATION_TYPE" in
+        skip)
+            # Testing only: Skip menu interaction
+            echo "[TEST MODE] Skipping menu interaction"
+            return 0
+            ;;
+        input)
+            # Testing only: Accept automated input
+            read -p "Enter your choice (1-3): " choice
+            ;;
+        none|*)
+            # Normal production behavior
+            read -p "Enter your choice (1-3): " choice
+            ;;
+    esac
+
+    case $choice in
+        1) handle_add_rules ;;
+        2) handle_delete_rules ;;
+        3) 
+            echo -e "\n${GREEN}Thanks for using IPCoffee! Stay caffeinated! ☕${NC}"
+            exit 0 
+            ;;
+        *) 
+            echo -e "${RED}Invalid choice. Please try again.${NC}"
+            show_menu
+            ;;
+    esac
+}
+
+# Main script execution
+verify_firewall_setup
+
+# Handle command line arguments
+case "${1:-}" in
+    -a|--add)
+        handle_add_rules
+        ;;
+    -d|--delete)
+        handle_delete_rules
+        ;;
+    *)
+        show_menu
+        ;;
+esac
+

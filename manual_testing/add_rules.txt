@@ -1,0 +1,6 @@
+# Add these rules to add_rules.txt
+192.168.1.100   80/tcp    Web Server 1
+192.168.1.101   443/tcp   Web Server 2
+192.168.1.102   22/tcp    SSH Server
+192.168.1.103   3306/tcp  Database
+
